@@ -1,6 +1,6 @@
-# ESP32 FFT TIME
+# ESP32-S3 FFT TIME
 
-Proyecto: **Captura y visualización de señales con el ADC interno del ESP32 + FFT + dashboard web + OLED**
+Proyecto: **Captura y visualización de señales con el ADC interno del ESP32-S3 + FFT + dashboard web + OLED**
 
 Desarrollado y documentado por [alvaro-salazar](https://github.com/alvaro-salazar)
 
@@ -34,8 +34,8 @@ Desarrollado y documentado por [alvaro-salazar](https://github.com/alvaro-salaza
 ## Cómo clonar y abrir
 
 ```sh
-git clone https://github.com/alvaro-salazar/esp32-fft-web.git
-cd esp32-fft-web
+git clone https://github.com/alvaro-salazar/esp32-s3-fft-web.git
+cd esp32-s3-fft-web
 code .
 ```
 PlatformIO detecta el proyecto al abrir VS Code.
