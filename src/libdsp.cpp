@@ -4,55 +4,61 @@
  * Licensed under the MIT License.
  */
 
-#include <driver/i2s.h>
 #include <driver/adc.h>
+#include <driver/timer.h>
 #include <Arduino.h>
+#include <string.h>
 #include <arduinoFFT.h>
 #include "libdisplay.h"
 #include "libwebsocket.h"
 #include "libdsp.h"
 
-#define I2S_PORT      I2S_NUM_0       // Este es el puerto I2S
-#define ADC_CH        ADC1_CHANNEL_0  // Este es el canal ADC
-#define SR_HZ         1000            // Esta es la frecuencia de muestreo  
-#define N_SAMPLES     1024            // Esta es la cantidad de muestras por bloque
-#define DMA_LEN       256             // Este es el tamaño del buffer de DMA
-#define DMA_CNT       4               // Este es el número de buffers de DMA
+#define ADC_CH        ADC1_CHANNEL_0  // Canal ADC (GPIO1 en ESP32-S3)
+#define SR_HZ         1000            // Frecuencia de muestreo (Hz)
+#define N_SAMPLES     1024            // Cantidad de muestras por bloque
+#define TIMER_DIVIDER 80              // Divisor del timer (80MHz / 80 = 1MHz = 1us por tick)
+#define TIMER_SCALE   (TIMER_BASE_CLK / TIMER_DIVIDER)  // Escala del timer
 
-static uint16_t  rawBuf[N_SAMPLES];   // Este es el buffer para almacenar las muestras
-static QueueHandle_t qFFT;            // Esta es la cola para envío de bloques de muestras
+static uint16_t  rawBuf[N_SAMPLES];   // Buffer para almacenar las muestras
+static uint16_t  block_copy[N_SAMPLES]; // Buffer para copiar antes de enviar (evita stack overflow)
+static uint16_t  dummy[N_SAMPLES];    // Buffer para descartar bloques antiguos (evita stack overflow)
+static QueueHandle_t qFFT;            // Cola para envío de bloques de muestras
+static hw_timer_t *timer = NULL;      // Timer para muestreo preciso
+static volatile uint32_t sample_idx = 0; // Índice de muestra (volatile para interrupción)
+static volatile bool buffer_ready = false; // Flag para indicar que el buffer está listo
 
-static double    vReal[N_SAMPLES];    // Este es el buffer para almacenar las magnitudes reales de la FFT
-static double    vImag[N_SAMPLES];    // Este es el buffer para almacenar las magnitudes imaginarias de la FFT
+static double    vReal[N_SAMPLES];    // Buffer para magnitudes reales de la FFT
+static double    vImag[N_SAMPLES];    // Buffer para magnitudes imaginarias de la FFT
 
-ArduinoFFT<double> FFT(vReal, vImag, N_SAMPLES, SR_HZ); // Este es el objeto FFT
+ArduinoFFT<double> FFT(vReal, vImag, N_SAMPLES, SR_HZ); // Objeto FFT
+
+// Interrupción del timer para muestreo preciso
+void IRAM_ATTR onTimer() {
+  if(sample_idx < N_SAMPLES) {
+    rawBuf[sample_idx++] = (uint16_t)adc1_get_raw(ADC_CH);
+    if(sample_idx >= N_SAMPLES) {
+      buffer_ready = true;
+      sample_idx = 0;
+    }
+  }
+}
 
 /**
- * @brief Configura el ADC y el I2S para la lectura de la señal analoga
+ * @brief Configura el ADC y el timer para muestreo preciso con DMA (ESP32-S3)
  * 
  */
 void setupAdc(){
-  adc1_config_width(ADC_WIDTH_BIT_12); // Configura el ancho del ADC a 12 bits
-  adc1_config_channel_atten(ADC_CH, ADC_ATTEN_DB_12); // Configura el canal ADC y el atenuador
-
-  // Configuración del I2S para la lectura de la señal analoga
-  const i2s_config_t cfg = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER|I2S_MODE_RX|I2S_MODE_ADC_BUILT_IN), // Configuración del modo del I2S
-    .sample_rate = SR_HZ, // Configuración de la frecuencia de muestreo
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, // Configuración del número de bits por muestra
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // Configuración del formato de canal
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S, // Configuración del formato de comunicación
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // Configuración de la interrupción
-    .dma_buf_count = DMA_CNT, // Configuración del número de buffers de DMA
-    .dma_buf_len = DMA_LEN, // Configuración del tamaño del buffer de DMA
-    .use_apll=true, // Configuración del PLL
-    .tx_desc_auto_clear=false, // Configuración del auto-clear del descriptor de transmisión
-    .fixed_mclk=0 // Configuración del reloj fijo
-  };
-  i2s_driver_install(I2S_PORT,&cfg,0,NULL); // Instala el driver del I2S
-  i2s_set_pin(I2S_PORT,NULL); // Configura los pines del I2S
-  i2s_set_adc_mode(ADC_UNIT_1,ADC_CH); // Configura el ADC
-  i2s_adc_enable(I2S_PORT); // Habilita el ADC
+  // Configura el ancho del ADC a 12 bits
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  
+  // Configura el canal ADC y el atenuador (0-3.3V)
+  adc1_config_channel_atten(ADC_CH, ADC_ATTEN_DB_12);
+  
+  // Configura el timer para muestreo preciso
+  timer = timerBegin(0, TIMER_DIVIDER, true);  // Timer 0, divisor 80, cuenta hacia arriba
+  timerAttachInterrupt(timer, onTimer, true);  // Asocia la interrupción (true = edge triggered)
+  timerAlarmWrite(timer, TIMER_SCALE / SR_HZ, true); // Configura el período (1000us para 1000Hz)
+  timerAlarmEnable(timer);                      // Habilita la alarma del timer
 }
 
 /**
@@ -63,23 +69,30 @@ void setQueue(){
 }
 
 /**
- * @brief Tarea para la lectura del ADC
+ * @brief Tarea para la lectura del ADC con timer e interrupciones (ESP32-S3)
+ *        Usa un timer de hardware para muestreo preciso y envía bloques a la cola
  */
 void taskADC(void *){
-  size_t bytes; // Tamaño de los datos leídos
-  uint8_t tmp[DMA_LEN*2]; // Buffer temporal para almacenar los datos leídos
-  uint32_t idx = 0; // Índice para recorrer el buffer de muestras
-
   for(;;){
-    if(i2s_read(I2S_PORT, tmp, sizeof(tmp), &bytes, portMAX_DELAY)==ESP_OK){
-      for(size_t i=0; i<bytes; i+=2){ // Recorre el buffer de muestras
-        rawBuf[idx++] = tmp[i] | (tmp[i+1]<<8); // Convierte los datos leídos a enteros de 16 bits
-        if(idx==N_SAMPLES){ // Si se ha leído el número de muestras definido
-          idx = 0;
-          xQueueSend(qFFT, rawBuf, 0);   // envía bloque completo a la cola
-        }
+    // Espera a que el buffer esté listo (muestreado por la interrupción del timer)
+    if(buffer_ready){
+      // Desactiva temporalmente las interrupciones para copiar el buffer de forma segura
+      portDISABLE_INTERRUPTS();
+      memcpy(block_copy, rawBuf, N_SAMPLES * sizeof(uint16_t));
+      buffer_ready = false;
+      portENABLE_INTERRUPTS();
+      
+      // Envía bloque completo a la cola (sin bloquear si la cola está llena)
+      BaseType_t queue_result = xQueueSend(qFFT, block_copy, 0);
+      if(queue_result != pdTRUE){
+        // Si la cola está llena, descarta el bloque anterior y envía el nuevo
+        // Esto previene que se acumulen datos y cause "pegado"
+        xQueueReceive(qFFT, dummy, 0); // Descarta el bloque más antiguo
+        xQueueSend(qFFT, block_copy, 0);  // Envía el nuevo bloque
       }
     }
+    // Pequeño delay para evitar saturar el CPU
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -90,7 +103,8 @@ void taskFFT(void *){
   uint16_t block[N_SAMPLES]; // Buffer para almacenar el bloque de muestras
 
   for(;;){
-    if(xQueueReceive(qFFT, block, portMAX_DELAY)==pdTRUE){
+    // Recibe bloque de muestras (con timeout para evitar bloqueos)
+    if(xQueueReceive(qFFT, block, pdMS_TO_TICKS(100))==pdTRUE){
       double mean = 0; // Media de las muestras
       for (uint16_t i=0;i<N_SAMPLES;i++) mean += block[i]; // Calcula la media de las muestras
       mean /= N_SAMPLES; // Divide la suma por el número de muestras para obtener la media
@@ -121,9 +135,12 @@ void taskFFT(void *){
       }
       json += "]}"; // Agrega el cierre del JSON
 
-      ws.textAll(json);   // Envía el JSON a todos los clientes
+      // Envía el JSON a todos los clientes (sin bloquear)
+      ws.textAll(json);   // Envía el JSON
 
       drawFFT(vReal, vImag); // Dibuja el espectro FFT en la pantalla OLED
     }
+    // Pequeño delay para evitar saturar el CPU
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }

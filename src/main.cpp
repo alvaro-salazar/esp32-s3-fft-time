@@ -31,7 +31,7 @@ void setup(){
   initDisplay();            //> 6. Inicializa la pantalla OLED 
   setupAdc();               //> 7. Inicializa el ADC usando I2S y DMA
   setQueue();               //> 8. Crea la cola para envío de bloques de muestras
-  xTaskCreatePinnedToCore(taskADC,"adc",4096,NULL,1,NULL,0);   //> 9. Agrega la tarea ADC al core 0
+  xTaskCreatePinnedToCore(taskADC,"adc",8192,NULL,1,NULL,0);   //> 9. Agrega la tarea ADC al core 0 (stack aumentado a 8KB)
   xTaskCreatePinnedToCore(taskFFT,"fft",6144,NULL,1,NULL,1);   //> 10. Agrega la tarea FFT al core 1
   setupWebSocket();         //> 11. Inicializa el servidor web y el websocket
 }
